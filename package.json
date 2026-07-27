@@ -1,0 +1,35 @@
+{
+  "name": "opencode-obsidian-export",
+  "version": "1.0.0",
+  "description": "Auto-save opencode sessions to Obsidian vault as markdown — effortless, zero-config.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "keywords": [
+    "opencode",
+    "obsidian",
+    "plugin",
+    "export",
+    "markdown",
+    "notes",
+    "logging"
+  ],
+  "author": "Adit Rachman",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aditrachman/Opencode-Obsidian-Export.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aditrachman/Opencode-Obsidian-Export/issues"
+  },
+  "homepage": "https://github.com/aditrachman/Opencode-Obsidian-Export#readme",
+  "dependencies": {
+    "jsonrepair": "^3.15.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
