@@ -32,8 +32,19 @@ function getConfig() {
   const userName = process.env.OPENCODE_USER_NAME || "You";
   const assistantName = process.env.OPENCODE_ASSISTANT_NAME || "Assistant";
   const sessionPrefix = process.env.OPENCODE_SESSION_PREFIX || "Session";
+  // Filename format. Tokens: {date} {hostname} {title} {sessionId}
+  // Default keeps the original "YYYY-MM-DD - <title>" behaviour.
+  const filenameFormat =
+    process.env.OPENCODE_FILENAME_FORMAT || "{date} - {title}";
 
-  return { vaultPath, logSubdir, userName, assistantName, sessionPrefix };
+  return {
+    vaultPath,
+    logSubdir,
+    userName,
+    assistantName,
+    sessionPrefix,
+    filenameFormat,
+  };
 }
 
 function resolveLogDir(vaultPath, logSubdir) {
@@ -98,6 +109,20 @@ function sanitizeTitle(title) {
     .replace(/[\\/:*?"<>|]/g, "") // karakter ilegal di filename
     .trim()
     .slice(0, 60);
+}
+
+// Build the note filename from a token template.
+// Tokens: {date} {hostname} {title} {sessionId}. Always ends in ".md".
+function buildFilename(format, tokens) {
+  let name = format.replace(
+    /\{(date|hostname|title|sessionId)\}/g,
+    (_, k) => tokens[k] ?? ""
+  );
+  // Collapse whitespace/leftover separators from empty tokens.
+  name = name.replace(/\s{2,}/g, " ").replace(/^[\s-]+|[\s-]+$/g, "").trim();
+  if (!name) name = tokens.title || tokens.sessionId || "session";
+  if (!name.toLowerCase().endsWith(".md")) name += ".md";
+  return name;
 }
 
 function extractText(parts) {
@@ -389,7 +414,12 @@ async function writeSessionNote(sessionId, cfg) {
 
   const dateStr = new Date(createdMs).toISOString().slice(0, 10);
   const safeTitle = sanitizeTitle(title);
-  const filename = `${dateStr} - ${safeTitle}.md`;
+  const filename = buildFilename(cfg.filenameFormat, {
+    date: dateStr,
+    title: safeTitle,
+    hostname: sanitizeTitle(os.hostname().split(".")[0]),
+    sessionId,
+  });
   const logDir = resolveLogDir(cfg.vaultPath, cfg.logSubdir);
 
   await mkdir(logDir, { recursive: true });

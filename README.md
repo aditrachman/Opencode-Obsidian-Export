@@ -88,6 +88,17 @@ export OPENCODE_SESSION_PREFIX="Session"   # 📝 title prefix (default: "Sessio
 export OPENCODE_LOG_SUBDIR="OpenCode-Logs" # 📁 subfolder in vault (default: "OpenCode-Logs")
 ```
 
+### Filename format
+
+By default notes are named `YYYY-MM-DD - <title>.md`. Customize it with a token template:
+
+```bash
+# Tokens: {date} {hostname} {title} {sessionId}
+export OPENCODE_FILENAME_FORMAT="{hostname} - {title}"   # e.g. "Rvs-Mac-Mini - Fix auth bug.md"
+```
+
+Empty tokens and their leftover separators are cleaned up automatically, and `.md` is always appended.
+
 Example — for a Raya-chan character setup:
 
 ```bash
