@@ -35,6 +35,20 @@ The agent recognizes the intent and invokes the `export_to_obsidian` tool. It ta
 
 You can confirm the tool is loaded by asking the agent to *"list your available tools"* — `export_to_obsidian` should appear alongside the built-ins.
 
+### Optional: a `/export-obsidian` slash command
+
+Plain English works fine, but if you want a one-keystroke `/export-obsidian` in the TUI, add a command file. A command is just a markdown prompt template that tells the agent to call the tool — copy [`examples/commands/export-obsidian.md`](examples/commands/export-obsidian.md) into your commands dir:
+
+```bash
+# Global (all projects)
+cp examples/commands/export-obsidian.md ~/.config/opencode/commands/
+
+# …or per-project
+mkdir -p .opencode/commands && cp examples/commands/export-obsidian.md .opencode/commands/
+```
+
+Then type `/export-obsidian` in the TUI. Under the hood it just asks the agent to invoke the `export_to_obsidian` tool for the current session — so the tool remains the source of truth; the command is only a convenience shortcut.
+
 ## Setup
 
 ### 1. Install (npm — recommended)
