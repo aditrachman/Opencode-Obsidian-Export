@@ -2,14 +2,11 @@
 // Pakai: tinggal tambah "opencode-obsidian-export" ke plugin list di opencode.json
 // Set env OBSIDIAN_VAULT_PATH ke path vault Obsidian lo, beres.
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { writeFile, appendFile, readFile, mkdir, unlink } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { writeFile, appendFile, readFile, mkdir, unlink, open, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { tool } from "@opencode-ai/plugin";
-
-const execFileAsync = promisify(execFile);
 
 const PKG_NAME = "opencode-obsidian-export";
 const PKG_VERSION = "1.1.0";
@@ -98,9 +95,6 @@ try {
     "Ini bukan error — plugin tetap jalan normal."
   );
 }
-
-// Default maxBuffer Node cuma 1MB, gampang kepotong pas sesi panjang.
-const EXPORT_MAX_BUFFER = 1024 * 1024 * 100; // 100MB
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -353,10 +347,45 @@ async function saveIndex(index) {
 }
 
 // ─── Export session dari opencode CLI ───────────────────────────────────
+// IMPORTANT: We spawn `opencode export` with stdout redirected to a TEMP FILE
+// rather than capturing via a pipe (execFile). When this plugin runs *inside*
+// a live opencode/openchamber instance, the nested `opencode export` child
+// disposes its instance and exits before it finishes flushing a piped stdout,
+// which silently TRUNCATES the JSON (e.g. ~63KB instead of ~740KB) — only the
+// first handful of messages survive. Writing to a file has no pipe-buffer race,
+// so we get the complete transcript. See regression: truncated Obsidian notes.
+async function runExportToFile(sessionId) {
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `opencode-obsidian-export-${sessionId}-${Date.now()}.json`
+  );
+  const fh = await open(tmpPath, "w");
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn("opencode", ["export", sessionId], {
+        stdio: ["ignore", fh.fd, "ignore"],
+      });
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0
+          ? resolve()
+          : reject(new Error(`opencode export exited with code ${code}`))
+      );
+    });
+  } finally {
+    await fh.close();
+  }
+  return tmpPath;
+}
+
 async function exportSession(sessionId) {
-  const { stdout } = await execFileAsync("opencode", ["export", sessionId], {
-    maxBuffer: EXPORT_MAX_BUFFER,
-  });
+  const tmpPath = await runExportToFile(sessionId);
+  let stdout;
+  try {
+    stdout = await readFile(tmpPath, "utf-8");
+  } finally {
+    await rm(tmpPath, { force: true }).catch(() => {});
+  }
 
   // CLI kadang ngeprint teks lain ke stdout bareng JSON-nya.
   // Potong dari { pertama ke } terakhir biar sampah gak ikut ke parser.
