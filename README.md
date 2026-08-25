@@ -15,11 +15,18 @@ On top of the raw transcript, each note now starts with an **Agent Context** blo
 
 - **Frontmatter:** `session_id`, `title`, `created`/`updated`, `agent`, `model`, `directory`, a ready-to-run `resume_cmd` (`opencode -s <id>`), and `tags: [opencode-session, agent-context]`.
 - **Goal:** the first substantive user message (the intent of the session).
+- **📝 Summary:** an optional agent-written narrative (goal, what was done, decisions/gotchas, current state, next steps). See below.
 - **Highlights:** heuristically extracted lines tagged `decision` / `gotcha` / `todo` / `fix`.
 - **Files touched:** every file path referenced by `read`/`edit`/`write` tool calls.
 - **Tools used** and **diff stat** (`+adds / -dels across N files`).
 
-This is deterministic and needs no LLM call — it's cheap line/tool analysis.
+The frontmatter, highlights, files, and tools are deterministic — no LLM call. The **Summary** is different: OpenCode has no built-in prose summary, so it's supplied by the agent (see next section).
+
+### The summary (agent-written)
+
+`export_to_obsidian` takes an optional `summary` argument. When an agent runs the export, it writes a concise narrative — *goal, what was done, key decisions/gotchas, current state, next steps* — and passes it in; the plugin injects it as a `### 📝 Summary` section at the top of the note. This is the part a future agent reads first to resume without re-reading the whole transcript.
+
+On automatic `session.idle` exports (no agent authoring one) the summary is simply omitted and the deterministic block still applies. There's no hidden LLM call and no extra cost — the summary comes from whichever agent is already running the export.
 
 ## Manual export
 

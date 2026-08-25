@@ -223,13 +223,14 @@ function formatModel(model) {
   return `${provider}${model.id || ""}`;
 }
 
-function buildAgentContext(session, cfg) {
+function buildAgentContext(session, cfg, opts = {}) {
   const info = session.info || {};
   const goal = extractGoal(session);
   const files = extractFilesTouched(session);
   const tools = extractToolUsage(session);
   const highlights = extractHighlights(session);
   const diff = info.summary || {};
+  const summary = typeof opts.summary === "string" ? opts.summary.trim() : "";
 
   const fm = [
     "---",
@@ -248,6 +249,11 @@ function buildAgentContext(session, cfg) {
 
   const ctx = ["## 🧭 Agent Context", ""];
   if (goal) ctx.push(`**Goal:** ${goal.replace(/\n/g, " ")}`, "");
+
+  // Agent-written narrative summary (passed in by the calling agent via the
+  // export_to_obsidian tool). Placed prominently so a future agent reads it
+  // first. Omitted on automatic session.idle exports where no agent authored one.
+  if (summary) ctx.push("### 📝 Summary", "", summary, "");
 
   if (highlights.length) {
     ctx.push("**Highlights:**");
@@ -280,14 +286,14 @@ function buildAgentContext(session, cfg) {
   return fm.join("\n") + ctx.join("\n");
 }
 
-function messagesToMarkdown(session, cfg) {
+function messagesToMarkdown(session, cfg, opts = {}) {
   const info = session.info || {};
   const title = info.title || info.id || "Untitled Session";
   const sessionId = info.id || "unknown";
   const createdMs = info.time?.created || Date.now();
 
   const lines = [
-    buildAgentContext(session, cfg),
+    buildAgentContext(session, cfg, opts),
     `# ${cfg.sessionPrefix}: ${title}`,
     "",
     `session_id: ${sessionId}`,
@@ -435,11 +441,11 @@ async function exportSession(sessionId) {
 
 // ─── Shared: export one session → write note to vault ───────────────────
 // Returns the absolute path of the written note (or null if skipped).
-async function writeSessionNote(sessionId, cfg) {
+async function writeSessionNote(sessionId, cfg, opts = {}) {
   if (!cfg.vaultPath) return null;
 
   const session = await exportSession(sessionId);
-  const { markdown, title, createdMs } = messagesToMarkdown(session, cfg);
+  const { markdown, title, createdMs } = messagesToMarkdown(session, cfg, opts);
 
   const dateStr = new Date(createdMs).toISOString().slice(0, 10);
   const safeTitle = sanitizeTitle(title);
@@ -514,15 +520,27 @@ export const ExportToObsidian = async ({ project, directory }) => {
       export_to_obsidian: tool({
         description:
           "Export the current (or a specified) opencode session to the " +
-          "Obsidian vault as a markdown note with an agent-context summary " +
-          "(goal, highlights, files touched, tools used). Use when the user " +
-          "asks to save/export/sync the session to Obsidian.",
+          "Obsidian vault as a markdown note. Before calling, WRITE a concise " +
+          "narrative `summary` of the session so a future agent can resume " +
+          "without re-reading the whole transcript: what the goal was, what " +
+          "was actually done, key decisions/gotchas, the current state, and " +
+          "clear next steps. Use when the user asks to save/export/sync the " +
+          "session to Obsidian.",
         args: {
           sessionId: tool.schema
             .string()
             .optional()
             .describe(
               "Session id to export. Omit to export the current session."
+            ),
+          summary: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "A concise narrative summary YOU (the agent) write for the " +
+                "note's Agent Context block. Cover: goal, what was done, key " +
+                "decisions/gotchas, current state, and next steps. Markdown " +
+                "allowed. Omit only if there is genuinely nothing to summarize."
             ),
         },
         async execute(args) {
@@ -540,7 +558,9 @@ export const ExportToObsidian = async ({ project, directory }) => {
           }
 
           try {
-            const written = await writeSessionNote(sid, currentCfg);
+            const written = await writeSessionNote(sid, currentCfg, {
+              summary: args.summary,
+            });
             return written
               ? `Exported session ${sid} → ${written}`
               : `Nothing written for session ${sid}.`;
