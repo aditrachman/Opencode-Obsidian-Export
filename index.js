@@ -7,11 +7,16 @@ import { promisify } from "node:util";
 import { writeFile, appendFile, readFile, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { tool } from "@opencode-ai/plugin";
 
 const execFileAsync = promisify(execFile);
 
 const PKG_NAME = "opencode-obsidian-export";
-const PKG_VERSION = "1.0.0";
+const PKG_VERSION = "1.1.0";
+
+// Track the most-recently-active session so the manual `export_to_obsidian`
+// tool knows which session to export when invoked without an explicit id.
+let LAST_ACTIVE_SESSION_ID = null;
 
 // ─── Config dari env var ────────────────────────────────────────────────
 // WAJIB: OBSIDIAN_VAULT_PATH — path ke vault Obsidian
@@ -112,6 +117,150 @@ function extractToolNotes(parts) {
     });
 }
 
+// ─── Agent-context extraction (add-on) ──────────────────────────────────
+// The upstream plugin dumps the raw transcript. These helpers additionally
+// distill a compact, agent-readable summary + highlights block so a FUTURE
+// agent can @-load this note and resume work without re-deriving everything
+// from scratch.
+
+const YAML_ESCAPE = (s) =>
+  typeof s === "string" && /[:#\-?\[\]{}&*!|>'"%@`\n]/.test(s)
+    ? JSON.stringify(s)
+    : s;
+
+// Collect every distinct file path referenced by tool calls (read/edit/write).
+function extractFilesTouched(session) {
+  const files = new Set();
+  const FILE_ARG_KEYS = ["filePath", "path", "file"];
+  for (const msg of session.messages || []) {
+    for (const p of msg.parts || []) {
+      if (p.type !== "tool") continue;
+      const input = p.state?.input || {};
+      for (const k of FILE_ARG_KEYS) {
+        if (typeof input[k] === "string") files.add(input[k]);
+      }
+    }
+  }
+  return [...files];
+}
+
+// Tally which tools were used, most-used first.
+function extractToolUsage(session) {
+  const counts = new Map();
+  for (const msg of session.messages || []) {
+    for (const p of msg.parts || []) {
+      if (p.type !== "tool" || !p.tool) continue;
+      counts.set(p.tool, (counts.get(p.tool) || 0) + 1);
+    }
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+// Heuristic highlight extraction from assistant text: decisions, gotchas,
+// TODOs, and warnings. Line-based — cheap, deterministic, no LLM needed.
+const HIGHLIGHT_PATTERNS = [
+  { tag: "decision", re: /\b(decided|chose|going with|we will|approach:|plan:)\b/i },
+  { tag: "gotcha", re: /\b(gotcha|caveat|note that|be careful|important:|warning|caution|beware)\b/i },
+  { tag: "todo", re: /\b(todo|follow-?up|next step|remaining|still need|not yet)\b/i },
+  { tag: "fix", re: /\b(root cause|the bug|the issue was|fixed by|because)\b/i },
+];
+
+function extractHighlights(session, max = 12) {
+  const out = [];
+  for (const msg of session.messages || []) {
+    if (msg.info?.role !== "assistant") continue;
+    for (const p of msg.parts || []) {
+      if (p.type !== "text" || !p.text) continue;
+      for (const raw of p.text.split(/\n+/)) {
+        const line = raw.trim().replace(/^[-*>#\s]+/, "");
+        if (line.length < 12 || line.length > 240) continue;
+        for (const { tag, re } of HIGHLIGHT_PATTERNS) {
+          if (re.test(line)) {
+            out.push({ tag, line });
+            break;
+          }
+        }
+        if (out.length >= max) return out;
+      }
+    }
+  }
+  return out;
+}
+
+// First substantive user message = the session's goal/intent.
+function extractGoal(session) {
+  for (const msg of session.messages || []) {
+    if (msg.info?.role !== "user") continue;
+    const text = extractText(msg.parts || []);
+    if (text) return text.slice(0, 400);
+  }
+  return "";
+}
+
+function formatModel(model) {
+  if (!model) return "";
+  if (typeof model === "string") return model;
+  const provider = model.providerID ? `${model.providerID}/` : "";
+  return `${provider}${model.id || ""}`;
+}
+
+function buildAgentContext(session, cfg) {
+  const info = session.info || {};
+  const goal = extractGoal(session);
+  const files = extractFilesTouched(session);
+  const tools = extractToolUsage(session);
+  const highlights = extractHighlights(session);
+  const diff = info.summary || {};
+
+  const fm = [
+    "---",
+    `session_id: ${YAML_ESCAPE(info.id || "unknown")}`,
+    `title: ${YAML_ESCAPE(info.title || "")}`,
+    `created: ${new Date(info.time?.created || Date.now()).toISOString()}`,
+    `updated: ${new Date(info.time?.updated || Date.now()).toISOString()}`,
+    `agent: ${YAML_ESCAPE(info.agent || "")}`,
+    `model: ${YAML_ESCAPE(formatModel(info.model))}`,
+    `directory: ${YAML_ESCAPE(info.directory || "")}`,
+    `resume_cmd: ${YAML_ESCAPE(`opencode -s ${info.id || ""}`)}`,
+    "tags: [opencode-session, agent-context]",
+    "---",
+    "",
+  ];
+
+  const ctx = ["## 🧭 Agent Context", ""];
+  if (goal) ctx.push(`**Goal:** ${goal.replace(/\n/g, " ")}`, "");
+
+  if (highlights.length) {
+    ctx.push("**Highlights:**");
+    for (const h of highlights) ctx.push(`- \`${h.tag}\` — ${h.line}`);
+    ctx.push("");
+  }
+
+  if (files.length) {
+    ctx.push("**Files touched:**");
+    for (const f of files.slice(0, 30)) ctx.push(`- \`${f}\``);
+    if (files.length > 30) ctx.push(`- …and ${files.length - 30} more`);
+    ctx.push("");
+  }
+
+  if (tools.length) {
+    ctx.push(
+      "**Tools used:** " + tools.map(([t, n]) => `${t}×${n}`).join(", "),
+      ""
+    );
+  }
+
+  if (typeof diff.additions === "number") {
+    ctx.push(
+      `**Diff stat:** +${diff.additions} / -${diff.deletions} across ${diff.files} file(s)`,
+      ""
+    );
+  }
+
+  ctx.push("---", "");
+  return fm.join("\n") + ctx.join("\n");
+}
+
 function messagesToMarkdown(session, cfg) {
   const info = session.info || {};
   const title = info.title || info.id || "Untitled Session";
@@ -119,6 +268,7 @@ function messagesToMarkdown(session, cfg) {
   const createdMs = info.time?.created || Date.now();
 
   const lines = [
+    buildAgentContext(session, cfg),
     `# ${cfg.sessionPrefix}: ${title}`,
     "",
     `session_id: ${sessionId}`,
@@ -229,6 +379,36 @@ async function exportSession(sessionId) {
   }
 }
 
+// ─── Shared: export one session → write note to vault ───────────────────
+// Returns the absolute path of the written note (or null if skipped).
+async function writeSessionNote(sessionId, cfg) {
+  if (!cfg.vaultPath) return null;
+
+  const session = await exportSession(sessionId);
+  const { markdown, title, createdMs } = messagesToMarkdown(session, cfg);
+
+  const dateStr = new Date(createdMs).toISOString().slice(0, 10);
+  const safeTitle = sanitizeTitle(title);
+  const filename = `${dateStr} - ${safeTitle}.md`;
+  const logDir = resolveLogDir(cfg.vaultPath, cfg.logSubdir);
+
+  await mkdir(logDir, { recursive: true });
+
+  const index = await loadIndex();
+  const previousFilename = index[sessionId];
+  if (previousFilename && previousFilename !== filename) {
+    await unlink(path.join(logDir, previousFilename)).catch(() => {});
+  }
+
+  const fullPath = path.join(logDir, filename);
+  await writeFile(fullPath, markdown);
+
+  index[sessionId] = filename;
+  await saveIndex(index);
+
+  return fullPath;
+}
+
 // ─── Plugin entry — dipanggil opencode ──────────────────────────────────
 
 export const ExportToObsidian = async ({ project, directory }) => {
@@ -251,40 +431,66 @@ export const ExportToObsidian = async ({ project, directory }) => {
   }
 
   return {
+    // Track the active session id so the manual tool can default to it.
     event: async ({ event }) => {
-      if (event.type !== "session.idle") return;
+      const sid = event.properties?.sessionID || event.sessionID;
+      if (sid) LAST_ACTIVE_SESSION_ID = sid;
 
-      const sessionId = event.properties?.sessionID || event.sessionID;
-      if (!sessionId) return;
+      if (event.type !== "session.idle") return;
+      if (!sid) return;
 
       const currentCfg = getConfig();
       if (!currentCfg.vaultPath) return; // env var gak di-set, skip
 
       try {
-        const session = await exportSession(sessionId);
-        const { markdown, title, createdMs } = messagesToMarkdown(session, currentCfg);
-
-        const dateStr = new Date(createdMs).toISOString().slice(0, 10);
-        const safeTitle = sanitizeTitle(title);
-        const filename = `${dateStr} - ${safeTitle}.md`;
-        const logDir = resolveLogDir(currentCfg.vaultPath, currentCfg.logSubdir);
-
-        await mkdir(logDir, { recursive: true });
-
-        const index = await loadIndex();
-        const previousFilename = index[sessionId];
-
-        if (previousFilename && previousFilename !== filename) {
-          await unlink(path.join(logDir, previousFilename)).catch(() => {});
-        }
-
-        await writeFile(path.join(logDir, filename), markdown);
-
-        index[sessionId] = filename;
-        await saveIndex(index);
+        await writeSessionNote(sid, currentCfg);
       } catch (err) {
         await logToFile(`gagal export sesi: ${err?.stack || err}`);
       }
+    },
+
+    // Manual export trigger. Lets the user/agent export on demand instead of
+    // waiting for session.idle — e.g. "export this session to obsidian".
+    tool: {
+      export_to_obsidian: tool({
+        description:
+          "Export the current (or a specified) opencode session to the " +
+          "Obsidian vault as a markdown note with an agent-context summary " +
+          "(goal, highlights, files touched, tools used). Use when the user " +
+          "asks to save/export/sync the session to Obsidian.",
+        args: {
+          sessionId: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Session id to export. Omit to export the current session."
+            ),
+        },
+        async execute(args) {
+          const currentCfg = getConfig();
+          if (!currentCfg.vaultPath) {
+            return (
+              "OBSIDIAN_VAULT_PATH is not set — cannot export. " +
+              'Set it, e.g. export OBSIDIAN_VAULT_PATH="/path/to/vault".'
+            );
+          }
+
+          const sid = args.sessionId || LAST_ACTIVE_SESSION_ID;
+          if (!sid) {
+            return "No session id available yet. Pass sessionId explicitly.";
+          }
+
+          try {
+            const written = await writeSessionNote(sid, currentCfg);
+            return written
+              ? `Exported session ${sid} → ${written}`
+              : `Nothing written for session ${sid}.`;
+          } catch (err) {
+            await logToFile(`manual export gagal: ${err?.stack || err}`);
+            return `Export failed for ${sid}: ${err?.message || err}`;
+          }
+        },
+      }),
     },
   };
 };

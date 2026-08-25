@@ -3,11 +3,31 @@
 [![npm version](https://badge.fury.io/js/opencode-obsidian-export.svg)](https://www.npmjs.com/package/opencode-obsidian-export)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Auto-save your [opencode](https://opencode.ai) chat sessions as readable Markdown notes in your Obsidian vault — every time a session goes idle, it's synced automatically. No manual export, no extra steps.
+Auto-save your [opencode](https://opencode.ai) chat sessions as readable Markdown notes in your Obsidian vault — every time a session goes idle, it's synced automatically. Each note leads with an agent-readable summary (goal, highlights, files touched) so future agents can resume work without starting from scratch. Manual export on demand is supported too.
 
 ## Why
 
 opencode already lets you resume a session with `opencode -s <session-id>`, but there's no easy way to *browse* or *search* your past conversations alongside your other notes. This plugin writes each session to your Obsidian vault as a normal `.md` file, so it shows up in Obsidian's native search, graph view, etc.
+
+## Agent context (for resuming work)
+
+On top of the raw transcript, each note now starts with an **Agent Context** block plus YAML frontmatter, so a *future* agent can `@`-load the note and pick up where the last one left off — without re-deriving everything from scratch:
+
+- **Frontmatter:** `session_id`, `title`, `created`/`updated`, `agent`, `model`, `directory`, a ready-to-run `resume_cmd` (`opencode -s <id>`), and `tags: [opencode-session, agent-context]`.
+- **Goal:** the first substantive user message (the intent of the session).
+- **Highlights:** heuristically extracted lines tagged `decision` / `gotcha` / `todo` / `fix`.
+- **Files touched:** every file path referenced by `read`/`edit`/`write` tool calls.
+- **Tools used** and **diff stat** (`+adds / -dels across N files`).
+
+This is deterministic and needs no LLM call — it's cheap line/tool analysis.
+
+## Manual export
+
+Exports still happen automatically on `session.idle`, but the plugin also registers a tool so you (or the agent) can export **on demand** — just ask:
+
+> "export this session to obsidian"
+
+The tool is `export_to_obsidian` and takes an optional `sessionId` (defaults to the current session).
 
 ## Setup
 
@@ -82,8 +102,11 @@ export OPENCODE_LOG_SUBDIR="RayaChan-Logs"
 opencode's plugin system exposes a `session.idle` event, which fires whenever a session finishes responding and is waiting for the next input. This plugin listens for that event and:
 
 1. Runs `opencode export <sessionID>` to get the session as JSON
-2. Extracts the actual conversation text (skips internal step/reasoning metadata)
-3. Writes it to your vault as `YYYY-MM-DD - <title>.md`
+2. Builds an **Agent Context** block (goal, highlights, files touched, tools, diff stat) + YAML frontmatter
+3. Extracts the actual conversation text (skips internal step/reasoning metadata)
+4. Writes it to your vault as `YYYY-MM-DD - <title>.md`
+
+You can also trigger step 1–4 manually anytime via the `export_to_obsidian` tool.
 
 Because the file is keyed by session ID (tracked via `.session-index.json`), re-syncing an ongoing conversation updates the same file instead of creating duplicates. Old files with different titles for the same session are cleaned up automatically.
 
