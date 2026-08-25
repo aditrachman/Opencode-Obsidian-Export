@@ -23,11 +23,17 @@ This is deterministic and needs no LLM call — it's cheap line/tool analysis.
 
 ## Manual export
 
-Exports still happen automatically on `session.idle`, but the plugin also registers a tool so you (or the agent) can export **on demand** — just ask:
+Exports still happen automatically on `session.idle`, but the plugin also registers a **tool** so you (or the agent) can export **on demand**.
+
+It's not a slash-command or CLI keyword — it's a tool the agent calls. Just say something like:
 
 > "export this session to obsidian"
+> "save this session to my vault"
+> "sync this chat to obsidian"
 
-The tool is `export_to_obsidian` and takes an optional `sessionId` (defaults to the current session).
+The agent recognizes the intent and invokes the `export_to_obsidian` tool. It takes an optional `sessionId` (defaults to the current session), so you can also export another session by id.
+
+You can confirm the tool is loaded by asking the agent to *"list your available tools"* — `export_to_obsidian` should appear alongside the built-ins.
 
 ## Setup
 
@@ -98,6 +104,29 @@ export OPENCODE_FILENAME_FORMAT="{hostname} - {title}"   # e.g. "Rvs-Mac-Mini - 
 ```
 
 Empty tokens and their leftover separators are cleaned up automatically, and `.md` is always appended.
+
+`{hostname}` is your machine's short hostname (`os.hostname()` with the domain stripped) — handy when several machines sync into the same vault, so you can tell at a glance which box a session came from.
+
+#### Multi-machine setup (`~/.zshrc` / `~/.bashrc`)
+
+If you sync one Obsidian vault across machines (e.g. via Obsidian Sync, iCloud, Syncthing, or LiveSync) and want each machine's sessions grouped and labelled by host, add this block to your shell rc file:
+
+```bash
+# opencode → Obsidian session export
+export OBSIDIAN_VAULT_PATH="$HOME/Brain"                 # path to your vault
+export OPENCODE_LOG_SUBDIR="_Shared_Systems/Opencode"    # subfolder inside the vault
+export OPENCODE_FILENAME_FORMAT="{hostname} - {title}"   # prefix notes with the machine name
+```
+
+Then reload and restart opencode:
+
+```bash
+source ~/.zshrc   # or: source ~/.bashrc
+```
+
+Every machine writes into the same `_Shared_Systems/Opencode/` folder, with filenames like `Rvs-Mac-Mini - Fix auth bug.md` and `Work-Laptop - Deploy pipeline.md`, so they never collide and are easy to filter in Obsidian search.
+
+> Tip: check your machine's hostname first with `hostname -s` (macOS/Linux) so you know what the `{hostname}` token will resolve to.
 
 Example — for a Raya-chan character setup:
 
