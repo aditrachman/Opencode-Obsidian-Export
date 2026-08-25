@@ -42,19 +42,27 @@ The agent recognizes the intent and invokes the `export_to_obsidian` tool. It ta
 
 You can confirm the tool is loaded by asking the agent to *"list your available tools"* — `export_to_obsidian` should appear alongside the built-ins.
 
-### Optional: a `/export-obsidian` slash command
+### Slash commands (recommended)
 
-Plain English works fine, but if you want a one-keystroke `/export-obsidian` in the TUI, add a command file. A command is just a markdown prompt template that tells the agent to call the tool — copy [`examples/commands/export-obsidian.md`](examples/commands/export-obsidian.md) into your commands dir:
+Plain English works, but **commands are more reliable and repeatable than a prompt** — they always tell the agent to write a summary first and then call the tool the same way. Two are provided:
+
+| Command | What it writes |
+|---|---|
+| `/export2obsidian-summary` | A **summary-only** note (Agent Context block, no message dump) → `<hostname> - <title> Summary.md` |
+| `/export2obsidian-transcript` | The **full transcript** note (context + every message) → `<hostname> - <title> Transcript.md` |
+
+Both make the agent author the narrative `summary`, and both accept an optional custom filename typed after the command (e.g. `/export2obsidian-summary {date} - {title}`; tokens `{date} {hostname} {title} {sessionId}` are expanded).
+
+**Install** — one line each into `~/.config/opencode/commands/`, then **restart opencode**:
 
 ```bash
-# Global (all projects)
-cp examples/commands/export-obsidian.md ~/.config/opencode/commands/
-
-# …or per-project
-mkdir -p .opencode/commands && cp examples/commands/export-obsidian.md .opencode/commands/
+curl -fsSL https://raw.githubusercontent.com/aditrachman/Opencode-Obsidian-Export/main/examples/commands/export2obsidian-summary.md    -o ~/.config/opencode/commands/export2obsidian-summary.md
+curl -fsSL https://raw.githubusercontent.com/aditrachman/Opencode-Obsidian-Export/main/examples/commands/export2obsidian-transcript.md -o ~/.config/opencode/commands/export2obsidian-transcript.md
 ```
 
-Then type `/export-obsidian` in the TUI. Under the hood it just asks the agent to invoke the `export_to_obsidian` tool for the current session — so the tool remains the source of truth; the command is only a convenience shortcut.
+> Restart opencode after adding command files — they're only picked up at startup.
+
+Then type `/export2obsidian-summary` or `/export2obsidian-transcript` in the TUI. Under the hood each just invokes the `export_to_obsidian` tool — the tool stays the source of truth; the commands are convenience shortcuts.
 
 ## Setup
 
@@ -125,6 +133,8 @@ export OPENCODE_FILENAME_FORMAT="{hostname} - {title}"   # e.g. "Rvs-Mac-Mini - 
 ```
 
 Empty tokens and their leftover separators are cleaned up automatically, and `.md` is always appended.
+
+`OPENCODE_FILENAME_FORMAT` sets the **base** name. The plugin then appends a ` Summary` or ` Transcript` suffix depending on which kind of note is written, so both can live side by side for the same session — e.g. `Rvs-Mac-Mini - Fix auth bug Summary.md` and `Rvs-Mac-Mini - Fix auth bug Transcript.md`. To override the whole name for a one-off, pass a `filename` to the `export_to_obsidian` tool (or type it after a slash command).
 
 `{hostname}` is your machine's short hostname (`os.hostname()` with the domain stripped) — handy when several machines sync into the same vault, so you can tell at a glance which box a session came from.
 

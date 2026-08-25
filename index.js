@@ -294,14 +294,23 @@ function messagesToMarkdown(session, cfg, opts = {}) {
 
   const lines = [
     buildAgentContext(session, cfg, opts),
+  ];
+
+  // Summary-only notes stop after the Agent Context block. Full notes append
+  // the whole transcript below it.
+  if (opts.transcript === false) {
+    return { markdown: lines.join("\n"), title, sessionId, createdMs };
+  }
+
+  lines.push(
     `# ${cfg.sessionPrefix}: ${title}`,
     "",
     `session_id: ${sessionId}`,
     `created: ${new Date(createdMs).toISOString()}`,
     "",
     "---",
-    "",
-  ];
+    ""
+  );
 
   for (const msg of session.messages || []) {
     const role = msg.info?.role || "unknown";
@@ -449,18 +458,39 @@ async function writeSessionNote(sessionId, cfg, opts = {}) {
 
   const dateStr = new Date(createdMs).toISOString().slice(0, 10);
   const safeTitle = sanitizeTitle(title);
-  const filename = buildFilename(cfg.filenameFormat, {
-    date: dateStr,
-    title: safeTitle,
-    hostname: sanitizeTitle(os.hostname().split(".")[0]),
-    sessionId,
-  });
+
+  // Which kind of note is this? Drives the filename suffix + index key so a
+  // summary note and a transcript note for the SAME session coexist instead
+  // of overwriting each other.
+  const kind = opts.transcript === false ? "Summary" : "Transcript";
+
+  let filename;
+  if (opts.filename) {
+    // Explicit override from the caller (e.g. a command). Sanitize + ensure .md.
+    filename = buildFilename(String(opts.filename), {
+      date: dateStr,
+      title: safeTitle,
+      hostname: sanitizeTitle(os.hostname().split(".")[0]),
+      sessionId,
+    });
+  } else {
+    // Default: "<format> <Summary|Transcript>.md".
+    const base = buildFilename(cfg.filenameFormat, {
+      date: dateStr,
+      title: safeTitle,
+      hostname: sanitizeTitle(os.hostname().split(".")[0]),
+      sessionId,
+    }).replace(/\.md$/i, "");
+    filename = `${base} ${kind}.md`;
+  }
+
   const logDir = resolveLogDir(cfg.vaultPath, cfg.logSubdir);
 
   await mkdir(logDir, { recursive: true });
 
+  const indexKey = `${sessionId}::${kind}`;
   const index = await loadIndex();
-  const previousFilename = index[sessionId];
+  const previousFilename = index[indexKey];
   if (previousFilename && previousFilename !== filename) {
     await unlink(path.join(logDir, previousFilename)).catch(() => {});
   }
@@ -468,7 +498,7 @@ async function writeSessionNote(sessionId, cfg, opts = {}) {
   const fullPath = path.join(logDir, filename);
   await writeFile(fullPath, markdown);
 
-  index[sessionId] = filename;
+  index[indexKey] = filename;
   await saveIndex(index);
 
   return fullPath;
@@ -542,6 +572,22 @@ export const ExportToObsidian = async ({ project, directory }) => {
                 "decisions/gotchas, current state, and next steps. Markdown " +
                 "allowed. Omit only if there is genuinely nothing to summarize."
             ),
+          transcript: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "true (default) writes the full transcript note. false writes a " +
+                "summary-only note (Agent Context block, no message dump)."
+            ),
+          filename: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Optional filename override. Tokens {date}{hostname}{title}" +
+                "{sessionId} are expanded; '.md' is added if missing. When " +
+                "omitted, the name is '<hostname> - <title> " +
+                "<Summary|Transcript>.md'."
+            ),
         },
         async execute(args) {
           const currentCfg = getConfig();
@@ -560,6 +606,8 @@ export const ExportToObsidian = async ({ project, directory }) => {
           try {
             const written = await writeSessionNote(sid, currentCfg, {
               summary: args.summary,
+              transcript: args.transcript,
+              filename: args.filename,
             });
             return written
               ? `Exported session ${sid} → ${written}`
