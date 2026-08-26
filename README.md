@@ -3,11 +3,66 @@
 [![npm version](https://badge.fury.io/js/opencode-obsidian-export.svg)](https://www.npmjs.com/package/opencode-obsidian-export)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Auto-save your [opencode](https://opencode.ai) chat sessions as readable Markdown notes in your Obsidian vault — every time a session goes idle, it's synced automatically. No manual export, no extra steps.
+Auto-save your [opencode](https://opencode.ai) chat sessions as readable Markdown notes in your Obsidian vault — every time a session goes idle, it's synced automatically. Each note leads with an agent-readable summary (goal, highlights, files touched) so future agents can resume work without starting from scratch. Manual export on demand is supported too.
 
 ## Why
 
 opencode already lets you resume a session with `opencode -s <session-id>`, but there's no easy way to *browse* or *search* your past conversations alongside your other notes. This plugin writes each session to your Obsidian vault as a normal `.md` file, so it shows up in Obsidian's native search, graph view, etc.
+
+## Agent context (for resuming work)
+
+On top of the raw transcript, each note now starts with an **Agent Context** block plus YAML frontmatter, so a *future* agent can `@`-load the note and pick up where the last one left off — without re-deriving everything from scratch:
+
+- **Frontmatter:** `session_id`, `title`, `created`/`updated`, `agent`, `model`, `directory`, a ready-to-run `resume_cmd` (`opencode -s <id>`), and `tags: [opencode-session, agent-context]`.
+- **Goal:** the first substantive user message (the intent of the session).
+- **📝 Summary:** an optional agent-written narrative (goal, what was done, decisions/gotchas, current state, next steps). See below.
+- **Highlights:** heuristically extracted lines tagged `decision` / `gotcha` / `todo` / `fix`.
+- **Files touched:** every file path referenced by `read`/`edit`/`write` tool calls.
+- **Tools used** and **diff stat** (`+adds / -dels across N files`).
+
+The frontmatter, highlights, files, and tools are deterministic — no LLM call. The **Summary** is different: OpenCode has no built-in prose summary, so it's supplied by the agent (see next section).
+
+### The summary (agent-written)
+
+`export_to_obsidian` takes an optional `summary` argument. When an agent runs the export, it writes a concise narrative — *goal, what was done, key decisions/gotchas, current state, next steps* — and passes it in; the plugin injects it as a `### 📝 Summary` section at the top of the note. This is the part a future agent reads first to resume without re-reading the whole transcript.
+
+On automatic `session.idle` exports (no agent authoring one) the summary is simply omitted and the deterministic block still applies. There's no hidden LLM call and no extra cost — the summary comes from whichever agent is already running the export.
+
+## Manual export
+
+Exports still happen automatically on `session.idle`, but the plugin also registers a **tool** so you (or the agent) can export **on demand**.
+
+It's not a slash-command or CLI keyword — it's a tool the agent calls. Just say something like:
+
+> "export this session to obsidian"
+> "save this session to my vault"
+> "sync this chat to obsidian"
+
+The agent recognizes the intent and invokes the `export_to_obsidian` tool. It takes an optional `sessionId` (defaults to the current session), so you can also export another session by id.
+
+You can confirm the tool is loaded by asking the agent to *"list your available tools"* — `export_to_obsidian` should appear alongside the built-ins.
+
+### Slash commands (recommended)
+
+Plain English works, but **commands are more reliable and repeatable than a prompt** — they always tell the agent to write a summary first and then call the tool the same way. Two are provided:
+
+| Command | What it writes |
+|---|---|
+| `/export2obsidian-summary` | A **summary-only** note (Agent Context block, no message dump) → `<hostname> - <title> Summary.md` |
+| `/export2obsidian-transcript` | The **full transcript** note (context + every message) → `<hostname> - <title> Transcript.md` |
+
+Both make the agent author the narrative `summary`, and both accept an optional custom filename typed after the command (e.g. `/export2obsidian-summary {date} - {title}`; tokens `{date} {hostname} {title} {sessionId}` are expanded).
+
+**Install** — one line each into `~/.config/opencode/commands/`, then **restart opencode**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aditrachman/Opencode-Obsidian-Export/main/examples/commands/export2obsidian-summary.md    -o ~/.config/opencode/commands/export2obsidian-summary.md
+curl -fsSL https://raw.githubusercontent.com/aditrachman/Opencode-Obsidian-Export/main/examples/commands/export2obsidian-transcript.md -o ~/.config/opencode/commands/export2obsidian-transcript.md
+```
+
+> Restart opencode after adding command files — they're only picked up at startup.
+
+Then type `/export2obsidian-summary` or `/export2obsidian-transcript` in the TUI. Under the hood each just invokes the `export_to_obsidian` tool — the tool stays the source of truth; the commands are convenience shortcuts.
 
 ## Setup
 
@@ -68,6 +123,42 @@ export OPENCODE_SESSION_PREFIX="Session"   # 📝 title prefix (default: "Sessio
 export OPENCODE_LOG_SUBDIR="OpenCode-Logs" # 📁 subfolder in vault (default: "OpenCode-Logs")
 ```
 
+### Filename format
+
+By default notes are named `YYYY-MM-DD - <title>.md`. Customize it with a token template:
+
+```bash
+# Tokens: {date} {hostname} {title} {sessionId}
+export OPENCODE_FILENAME_FORMAT="{hostname} - {title}"   # e.g. "Rvs-Mac-Mini - Fix auth bug.md"
+```
+
+Empty tokens and their leftover separators are cleaned up automatically, and `.md` is always appended.
+
+`OPENCODE_FILENAME_FORMAT` sets the **base** name. The plugin then appends a ` Summary` or ` Transcript` suffix depending on which kind of note is written, so both can live side by side for the same session — e.g. `Rvs-Mac-Mini - Fix auth bug Summary.md` and `Rvs-Mac-Mini - Fix auth bug Transcript.md`. To override the whole name for a one-off, pass a `filename` to the `export_to_obsidian` tool (or type it after a slash command).
+
+`{hostname}` is your machine's short hostname (`os.hostname()` with the domain stripped) — handy when several machines sync into the same vault, so you can tell at a glance which box a session came from.
+
+#### Multi-machine setup (`~/.zshrc` / `~/.bashrc`)
+
+If you sync one Obsidian vault across machines (e.g. via Obsidian Sync, iCloud, Syncthing, or LiveSync) and want each machine's sessions grouped and labelled by host, add this block to your shell rc file:
+
+```bash
+# opencode → Obsidian session export
+export OBSIDIAN_VAULT_PATH="$HOME/Brain"                 # path to your vault
+export OPENCODE_LOG_SUBDIR="_Shared_Systems/Opencode"    # subfolder inside the vault
+export OPENCODE_FILENAME_FORMAT="{hostname} - {title}"   # prefix notes with the machine name
+```
+
+Then reload and restart opencode:
+
+```bash
+source ~/.zshrc   # or: source ~/.bashrc
+```
+
+Every machine writes into the same `_Shared_Systems/Opencode/` folder, with filenames like `Rvs-Mac-Mini - Fix auth bug.md` and `Work-Laptop - Deploy pipeline.md`, so they never collide and are easy to filter in Obsidian search.
+
+> Tip: check your machine's hostname first with `hostname -s` (macOS/Linux) so you know what the `{hostname}` token will resolve to.
+
 Example — for a Raya-chan character setup:
 
 ```bash
@@ -82,8 +173,11 @@ export OPENCODE_LOG_SUBDIR="RayaChan-Logs"
 opencode's plugin system exposes a `session.idle` event, which fires whenever a session finishes responding and is waiting for the next input. This plugin listens for that event and:
 
 1. Runs `opencode export <sessionID>` to get the session as JSON
-2. Extracts the actual conversation text (skips internal step/reasoning metadata)
-3. Writes it to your vault as `YYYY-MM-DD - <title>.md`
+2. Builds an **Agent Context** block (goal, highlights, files touched, tools, diff stat) + YAML frontmatter
+3. Extracts the actual conversation text (skips internal step/reasoning metadata)
+4. Writes it to your vault as `YYYY-MM-DD - <title>.md`
+
+You can also trigger step 1–4 manually anytime via the `export_to_obsidian` tool.
 
 Because the file is keyed by session ID (tracked via `.session-index.json`), re-syncing an ongoing conversation updates the same file instead of creating duplicates. Old files with different titles for the same session are cleaned up automatically.
 

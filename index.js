@@ -2,16 +2,18 @@
 // Pakai: tinggal tambah "opencode-obsidian-export" ke plugin list di opencode.json
 // Set env OBSIDIAN_VAULT_PATH ke path vault Obsidian lo, beres.
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { writeFile, appendFile, readFile, mkdir, unlink } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { writeFile, appendFile, readFile, mkdir, unlink, open, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-
-const execFileAsync = promisify(execFile);
+import { tool } from "@opencode-ai/plugin";
 
 const PKG_NAME = "opencode-obsidian-export";
-const PKG_VERSION = "1.0.0";
+const PKG_VERSION = "1.1.0";
+
+// Track the most-recently-active session so the manual `export_to_obsidian`
+// tool knows which session to export when invoked without an explicit id.
+let LAST_ACTIVE_SESSION_ID = null;
 
 // ─── Config dari env var ────────────────────────────────────────────────
 // WAJIB: OBSIDIAN_VAULT_PATH — path ke vault Obsidian
@@ -27,8 +29,19 @@ function getConfig() {
   const userName = process.env.OPENCODE_USER_NAME || "You";
   const assistantName = process.env.OPENCODE_ASSISTANT_NAME || "Assistant";
   const sessionPrefix = process.env.OPENCODE_SESSION_PREFIX || "Session";
+  // Filename format. Tokens: {date} {hostname} {title} {sessionId}
+  // Default keeps the original "YYYY-MM-DD - <title>" behaviour.
+  const filenameFormat =
+    process.env.OPENCODE_FILENAME_FORMAT || "{date} - {title}";
 
-  return { vaultPath, logSubdir, userName, assistantName, sessionPrefix };
+  return {
+    vaultPath,
+    logSubdir,
+    userName,
+    assistantName,
+    sessionPrefix,
+    filenameFormat,
+  };
 }
 
 function resolveLogDir(vaultPath, logSubdir) {
@@ -83,9 +96,6 @@ try {
   );
 }
 
-// Default maxBuffer Node cuma 1MB, gampang kepotong pas sesi panjang.
-const EXPORT_MAX_BUFFER = 1024 * 1024 * 100; // 100MB
-
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 function sanitizeTitle(title) {
@@ -93,6 +103,20 @@ function sanitizeTitle(title) {
     .replace(/[\\/:*?"<>|]/g, "") // karakter ilegal di filename
     .trim()
     .slice(0, 60);
+}
+
+// Build the note filename from a token template.
+// Tokens: {date} {hostname} {title} {sessionId}. Always ends in ".md".
+function buildFilename(format, tokens) {
+  let name = format.replace(
+    /\{(date|hostname|title|sessionId)\}/g,
+    (_, k) => tokens[k] ?? ""
+  );
+  // Collapse whitespace/leftover separators from empty tokens.
+  name = name.replace(/\s{2,}/g, " ").replace(/^[\s-]+|[\s-]+$/g, "").trim();
+  if (!name) name = tokens.title || tokens.sessionId || "session";
+  if (!name.toLowerCase().endsWith(".md")) name += ".md";
+  return name;
 }
 
 function extractText(parts) {
@@ -112,21 +136,181 @@ function extractToolNotes(parts) {
     });
 }
 
-function messagesToMarkdown(session, cfg) {
+// ─── Agent-context extraction (add-on) ──────────────────────────────────
+// The upstream plugin dumps the raw transcript. These helpers additionally
+// distill a compact, agent-readable summary + highlights block so a FUTURE
+// agent can @-load this note and resume work without re-deriving everything
+// from scratch.
+
+const YAML_ESCAPE = (s) =>
+  typeof s === "string" && /[:#\-?\[\]{}&*!|>'"%@`\n]/.test(s)
+    ? JSON.stringify(s)
+    : s;
+
+// Collect every distinct file path referenced by tool calls (read/edit/write).
+function extractFilesTouched(session) {
+  const files = new Set();
+  const FILE_ARG_KEYS = ["filePath", "path", "file"];
+  for (const msg of session.messages || []) {
+    for (const p of msg.parts || []) {
+      if (p.type !== "tool") continue;
+      const input = p.state?.input || {};
+      for (const k of FILE_ARG_KEYS) {
+        if (typeof input[k] === "string") files.add(input[k]);
+      }
+    }
+  }
+  return [...files];
+}
+
+// Tally which tools were used, most-used first.
+function extractToolUsage(session) {
+  const counts = new Map();
+  for (const msg of session.messages || []) {
+    for (const p of msg.parts || []) {
+      if (p.type !== "tool" || !p.tool) continue;
+      counts.set(p.tool, (counts.get(p.tool) || 0) + 1);
+    }
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+// Heuristic highlight extraction from assistant text: decisions, gotchas,
+// TODOs, and warnings. Line-based — cheap, deterministic, no LLM needed.
+const HIGHLIGHT_PATTERNS = [
+  { tag: "decision", re: /\b(decided|chose|going with|we will|approach:|plan:)\b/i },
+  { tag: "gotcha", re: /\b(gotcha|caveat|note that|be careful|important:|warning|caution|beware)\b/i },
+  { tag: "todo", re: /\b(todo|follow-?up|next step|remaining|still need|not yet)\b/i },
+  { tag: "fix", re: /\b(root cause|the bug|the issue was|fixed by|because)\b/i },
+];
+
+function extractHighlights(session, max = 12) {
+  const out = [];
+  for (const msg of session.messages || []) {
+    if (msg.info?.role !== "assistant") continue;
+    for (const p of msg.parts || []) {
+      if (p.type !== "text" || !p.text) continue;
+      for (const raw of p.text.split(/\n+/)) {
+        const line = raw.trim().replace(/^[-*>#\s]+/, "");
+        if (line.length < 12 || line.length > 240) continue;
+        for (const { tag, re } of HIGHLIGHT_PATTERNS) {
+          if (re.test(line)) {
+            out.push({ tag, line });
+            break;
+          }
+        }
+        if (out.length >= max) return out;
+      }
+    }
+  }
+  return out;
+}
+
+// First substantive user message = the session's goal/intent.
+function extractGoal(session) {
+  for (const msg of session.messages || []) {
+    if (msg.info?.role !== "user") continue;
+    const text = extractText(msg.parts || []);
+    if (text) return text.slice(0, 400);
+  }
+  return "";
+}
+
+function formatModel(model) {
+  if (!model) return "";
+  if (typeof model === "string") return model;
+  const provider = model.providerID ? `${model.providerID}/` : "";
+  return `${provider}${model.id || ""}`;
+}
+
+function buildAgentContext(session, cfg, opts = {}) {
+  const info = session.info || {};
+  const goal = extractGoal(session);
+  const files = extractFilesTouched(session);
+  const tools = extractToolUsage(session);
+  const highlights = extractHighlights(session);
+  const diff = info.summary || {};
+  const summary = typeof opts.summary === "string" ? opts.summary.trim() : "";
+
+  const fm = [
+    "---",
+    `session_id: ${YAML_ESCAPE(info.id || "unknown")}`,
+    `title: ${YAML_ESCAPE(info.title || "")}`,
+    `created: ${new Date(info.time?.created || Date.now()).toISOString()}`,
+    `updated: ${new Date(info.time?.updated || Date.now()).toISOString()}`,
+    `agent: ${YAML_ESCAPE(info.agent || "")}`,
+    `model: ${YAML_ESCAPE(formatModel(info.model))}`,
+    `directory: ${YAML_ESCAPE(info.directory || "")}`,
+    `resume_cmd: ${YAML_ESCAPE(`opencode -s ${info.id || ""}`)}`,
+    "tags: [opencode-session, agent-context]",
+    "---",
+    "",
+  ];
+
+  const ctx = ["## 🧭 Agent Context", ""];
+  if (goal) ctx.push(`**Goal:** ${goal.replace(/\n/g, " ")}`, "");
+
+  // Agent-written narrative summary (passed in by the calling agent via the
+  // export_to_obsidian tool). Placed prominently so a future agent reads it
+  // first. Omitted on automatic session.idle exports where no agent authored one.
+  if (summary) ctx.push("### 📝 Summary", "", summary, "");
+
+  if (highlights.length) {
+    ctx.push("**Highlights:**");
+    for (const h of highlights) ctx.push(`- \`${h.tag}\` — ${h.line}`);
+    ctx.push("");
+  }
+
+  if (files.length) {
+    ctx.push("**Files touched:**");
+    for (const f of files.slice(0, 30)) ctx.push(`- \`${f}\``);
+    if (files.length > 30) ctx.push(`- …and ${files.length - 30} more`);
+    ctx.push("");
+  }
+
+  if (tools.length) {
+    ctx.push(
+      "**Tools used:** " + tools.map(([t, n]) => `${t}×${n}`).join(", "),
+      ""
+    );
+  }
+
+  if (typeof diff.additions === "number") {
+    ctx.push(
+      `**Diff stat:** +${diff.additions} / -${diff.deletions} across ${diff.files} file(s)`,
+      ""
+    );
+  }
+
+  ctx.push("---", "");
+  return fm.join("\n") + ctx.join("\n");
+}
+
+function messagesToMarkdown(session, cfg, opts = {}) {
   const info = session.info || {};
   const title = info.title || info.id || "Untitled Session";
   const sessionId = info.id || "unknown";
   const createdMs = info.time?.created || Date.now();
 
   const lines = [
+    buildAgentContext(session, cfg, opts),
+  ];
+
+  // Summary-only notes stop after the Agent Context block. Full notes append
+  // the whole transcript below it.
+  if (opts.transcript === false) {
+    return { markdown: lines.join("\n"), title, sessionId, createdMs };
+  }
+
+  lines.push(
     `# ${cfg.sessionPrefix}: ${title}`,
     "",
     `session_id: ${sessionId}`,
     `created: ${new Date(createdMs).toISOString()}`,
     "",
     "---",
-    "",
-  ];
+    ""
+  );
 
   for (const msg of session.messages || []) {
     const role = msg.info?.role || "unknown";
@@ -178,10 +362,45 @@ async function saveIndex(index) {
 }
 
 // ─── Export session dari opencode CLI ───────────────────────────────────
+// IMPORTANT: We spawn `opencode export` with stdout redirected to a TEMP FILE
+// rather than capturing via a pipe (execFile). When this plugin runs *inside*
+// a live opencode/openchamber instance, the nested `opencode export` child
+// disposes its instance and exits before it finishes flushing a piped stdout,
+// which silently TRUNCATES the JSON (e.g. ~63KB instead of ~740KB) — only the
+// first handful of messages survive. Writing to a file has no pipe-buffer race,
+// so we get the complete transcript. See regression: truncated Obsidian notes.
+async function runExportToFile(sessionId) {
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `opencode-obsidian-export-${sessionId}-${Date.now()}.json`
+  );
+  const fh = await open(tmpPath, "w");
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn("opencode", ["export", sessionId], {
+        stdio: ["ignore", fh.fd, "ignore"],
+      });
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0
+          ? resolve()
+          : reject(new Error(`opencode export exited with code ${code}`))
+      );
+    });
+  } finally {
+    await fh.close();
+  }
+  return tmpPath;
+}
+
 async function exportSession(sessionId) {
-  const { stdout } = await execFileAsync("opencode", ["export", sessionId], {
-    maxBuffer: EXPORT_MAX_BUFFER,
-  });
+  const tmpPath = await runExportToFile(sessionId);
+  let stdout;
+  try {
+    stdout = await readFile(tmpPath, "utf-8");
+  } finally {
+    await rm(tmpPath, { force: true }).catch(() => {});
+  }
 
   // CLI kadang ngeprint teks lain ke stdout bareng JSON-nya.
   // Potong dari { pertama ke } terakhir biar sampah gak ikut ke parser.
@@ -229,6 +448,62 @@ async function exportSession(sessionId) {
   }
 }
 
+// ─── Shared: export one session → write note to vault ───────────────────
+// Returns the absolute path of the written note (or null if skipped).
+async function writeSessionNote(sessionId, cfg, opts = {}) {
+  if (!cfg.vaultPath) return null;
+
+  const session = await exportSession(sessionId);
+  const { markdown, title, createdMs } = messagesToMarkdown(session, cfg, opts);
+
+  const dateStr = new Date(createdMs).toISOString().slice(0, 10);
+  const safeTitle = sanitizeTitle(title);
+
+  // Which kind of note is this? Drives the filename suffix + index key so a
+  // summary note and a transcript note for the SAME session coexist instead
+  // of overwriting each other.
+  const kind = opts.transcript === false ? "Summary" : "Transcript";
+
+  let filename;
+  if (opts.filename) {
+    // Explicit override from the caller (e.g. a command). Sanitize + ensure .md.
+    filename = buildFilename(String(opts.filename), {
+      date: dateStr,
+      title: safeTitle,
+      hostname: sanitizeTitle(os.hostname().split(".")[0]),
+      sessionId,
+    });
+  } else {
+    // Default: "<format> <Summary|Transcript>.md".
+    const base = buildFilename(cfg.filenameFormat, {
+      date: dateStr,
+      title: safeTitle,
+      hostname: sanitizeTitle(os.hostname().split(".")[0]),
+      sessionId,
+    }).replace(/\.md$/i, "");
+    filename = `${base} ${kind}.md`;
+  }
+
+  const logDir = resolveLogDir(cfg.vaultPath, cfg.logSubdir);
+
+  await mkdir(logDir, { recursive: true });
+
+  const indexKey = `${sessionId}::${kind}`;
+  const index = await loadIndex();
+  const previousFilename = index[indexKey];
+  if (previousFilename && previousFilename !== filename) {
+    await unlink(path.join(logDir, previousFilename)).catch(() => {});
+  }
+
+  const fullPath = path.join(logDir, filename);
+  await writeFile(fullPath, markdown);
+
+  index[indexKey] = filename;
+  await saveIndex(index);
+
+  return fullPath;
+}
+
 // ─── Plugin entry — dipanggil opencode ──────────────────────────────────
 
 export const ExportToObsidian = async ({ project, directory }) => {
@@ -251,40 +526,98 @@ export const ExportToObsidian = async ({ project, directory }) => {
   }
 
   return {
+    // Track the active session id so the manual tool can default to it.
     event: async ({ event }) => {
-      if (event.type !== "session.idle") return;
+      const sid = event.properties?.sessionID || event.sessionID;
+      if (sid) LAST_ACTIVE_SESSION_ID = sid;
 
-      const sessionId = event.properties?.sessionID || event.sessionID;
-      if (!sessionId) return;
+      if (event.type !== "session.idle") return;
+      if (!sid) return;
 
       const currentCfg = getConfig();
       if (!currentCfg.vaultPath) return; // env var gak di-set, skip
 
       try {
-        const session = await exportSession(sessionId);
-        const { markdown, title, createdMs } = messagesToMarkdown(session, currentCfg);
-
-        const dateStr = new Date(createdMs).toISOString().slice(0, 10);
-        const safeTitle = sanitizeTitle(title);
-        const filename = `${dateStr} - ${safeTitle}.md`;
-        const logDir = resolveLogDir(currentCfg.vaultPath, currentCfg.logSubdir);
-
-        await mkdir(logDir, { recursive: true });
-
-        const index = await loadIndex();
-        const previousFilename = index[sessionId];
-
-        if (previousFilename && previousFilename !== filename) {
-          await unlink(path.join(logDir, previousFilename)).catch(() => {});
-        }
-
-        await writeFile(path.join(logDir, filename), markdown);
-
-        index[sessionId] = filename;
-        await saveIndex(index);
+        await writeSessionNote(sid, currentCfg);
       } catch (err) {
         await logToFile(`gagal export sesi: ${err?.stack || err}`);
       }
+    },
+
+    // Manual export trigger. Lets the user/agent export on demand instead of
+    // waiting for session.idle — e.g. "export this session to obsidian".
+    tool: {
+      export_to_obsidian: tool({
+        description:
+          "Export the current (or a specified) opencode session to the " +
+          "Obsidian vault as a markdown note. Before calling, WRITE a concise " +
+          "narrative `summary` of the session so a future agent can resume " +
+          "without re-reading the whole transcript: what the goal was, what " +
+          "was actually done, key decisions/gotchas, the current state, and " +
+          "clear next steps. Use when the user asks to save/export/sync the " +
+          "session to Obsidian.",
+        args: {
+          sessionId: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Session id to export. Omit to export the current session."
+            ),
+          summary: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "A concise narrative summary YOU (the agent) write for the " +
+                "note's Agent Context block. Cover: goal, what was done, key " +
+                "decisions/gotchas, current state, and next steps. Markdown " +
+                "allowed. Omit only if there is genuinely nothing to summarize."
+            ),
+          transcript: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "true (default) writes the full transcript note. false writes a " +
+                "summary-only note (Agent Context block, no message dump)."
+            ),
+          filename: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Optional filename override. Tokens {date}{hostname}{title}" +
+                "{sessionId} are expanded; '.md' is added if missing. When " +
+                "omitted, the name is '<hostname> - <title> " +
+                "<Summary|Transcript>.md'."
+            ),
+        },
+        async execute(args) {
+          const currentCfg = getConfig();
+          if (!currentCfg.vaultPath) {
+            return (
+              "OBSIDIAN_VAULT_PATH is not set — cannot export. " +
+              'Set it, e.g. export OBSIDIAN_VAULT_PATH="/path/to/vault".'
+            );
+          }
+
+          const sid = args.sessionId || LAST_ACTIVE_SESSION_ID;
+          if (!sid) {
+            return "No session id available yet. Pass sessionId explicitly.";
+          }
+
+          try {
+            const written = await writeSessionNote(sid, currentCfg, {
+              summary: args.summary,
+              transcript: args.transcript,
+              filename: args.filename,
+            });
+            return written
+              ? `Exported session ${sid} → ${written}`
+              : `Nothing written for session ${sid}.`;
+          } catch (err) {
+            await logToFile(`manual export gagal: ${err?.stack || err}`);
+            return `Export failed for ${sid}: ${err?.message || err}`;
+          }
+        },
+      }),
     },
   };
 };
