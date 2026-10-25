@@ -103,6 +103,17 @@ function sessionDirectory(info) {
 // idle and agent-switched messages, which are machinery rather than dialogue.
 const TRANSCRIPT_ROLES = new Set(["user", "assistant"]);
 
+// Which events mean "the session stopped working". v2.1.x does not reliably
+// emit `session.idle`; `session.status` (status.type = idle) and per-step
+// `session.step.ended` are the signals that actually arrive. Exporting on the
+// step boundary is harmless: the note is keyed by session id and rewritten.
+function isIdleEvent(event) {
+  const type = event?.type;
+  if (type === "session.idle" || type === "session.step.ended") return true;
+  if (type === "session.status") return event?.properties?.status?.type === "idle";
+  return false;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 function sanitizeTitle(title) {
@@ -250,7 +261,7 @@ function buildAgentContext(info, messages, cfg, opts = {}) {
   const fm = [
     "---",
     `session_id: ${YAML_ESCAPE(info.id || "unknown")}`,
-    `title: ${YAML_ESCAPE(info.title || "")}`,
+    `title: ${YAML_ESCAPE(info.title || goal.replace(/\s+/g, " ").slice(0, 60))}`,
     `created: ${new Date(info.time?.created || Date.now()).toISOString()}`,
     `updated: ${new Date(info.time?.updated || Date.now()).toISOString()}`,
     `agent: ${YAML_ESCAPE(info.agent || "")}`,
@@ -305,7 +316,11 @@ function buildAgentContext(info, messages, cfg, opts = {}) {
 }
 
 function messagesToMarkdown(info, messages, cfg, opts = {}) {
-  const title = info.title || info.id || "Untitled Session";
+  const title =
+    info.title ||
+    extractGoal(messages).replace(/\s+/g, " ").slice(0, 60) ||
+    info.id ||
+    "Untitled Session";
   const sessionId = info.id || "unknown";
   const createdMs = info.time?.created || Date.now();
 
@@ -530,19 +545,32 @@ export default {
 
     // Auto-export whenever a session goes idle.
     const controller = new AbortController();
+    const seenEventTypes = new Set();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (event?.type !== "session.idle") continue;
+          const type = event?.type || "unknown";
+          if (!seenEventTypes.has(type)) {
+            seenEventTypes.add(type);
+            await logToFile(`event received: ${type}`);
+          }
+          if (!isIdleEvent(event)) continue;
 
-          const sid = event.properties?.sessionID || event.sessionID;
-          if (!sid) continue;
+          const sid =
+            event.properties?.sessionID ||
+            event.data?.sessionID ||
+            event.sessionID;
+          if (!sid) {
+            await logToFile(`${type} without sessionID: ${JSON.stringify(event)}`);
+            continue;
+          }
 
           const currentCfg = getConfig();
           if (!currentCfg.vaultPath) continue;
 
           try {
-            await writeSessionNote(ctx, sid, currentCfg);
+            const written = await writeSessionNote(ctx, sid, currentCfg);
+            await logToFile(`auto export ok (${type}): ${sid} → ${written}`);
           } catch (err) {
             await logToFile(`auto export failed for ${sid}: ${err?.stack || err}`);
           }
