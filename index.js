@@ -1,64 +1,54 @@
-// Plugin opencode: auto-save session ke Obsidian vault tiap session.idle
-// Pakai: tinggal tambah "opencode-obsidian-export" ke plugin list di opencode.json
-// Set env OBSIDIAN_VAULT_PATH ke path vault Obsidian lo, beres.
+// opencode plugin: auto-save each session to an Obsidian vault on session.idle,
+// plus a manual `export_to_obsidian` tool.
+//
+// Ported to the OpenCode v2 plugin API.
+//   - v1 `event` hook          -> ctx.event.subscribe()
+//   - v1 `tool` map            -> ctx.tool.transform()
+//   - v1 `opencode export <id>`-> ctx.session.get() + ctx.session.context()
+//
+// Set OBSIDIAN_VAULT_PATH to your vault and you're done.
+//
+// NOTE: no `import { Plugin } from "@opencode/plugin"` here. Loose .js files in
+// ~/.config/opencode/plugins/ have no node_modules beside them, so that import
+// cannot resolve. Plugin.define is an identity function, so a plain default
+// export of { id, setup } is equivalent.
 
-import { spawn } from "node:child_process";
-import { writeFile, appendFile, readFile, mkdir, unlink, open, rm } from "node:fs/promises";
+import { writeFile, appendFile, readFile, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { tool } from "@opencode-ai/plugin";
 
 const PKG_NAME = "opencode-obsidian-export";
-const PKG_VERSION = "1.1.0";
+const PKG_VERSION = "2.0.0";
 
-// Track the most-recently-active session so the manual `export_to_obsidian`
-// tool knows which session to export when invoked without an explicit id.
-let LAST_ACTIVE_SESSION_ID = null;
-
-// ─── Config dari env var ────────────────────────────────────────────────
-// WAJIB: OBSIDIAN_VAULT_PATH — path ke vault Obsidian
-// Opsional:
-//   OPENCODE_LOG_SUBDIR     — subfolder di vault (default: "OpenCode-Logs")
-//   OPENCODE_USER_NAME      — label user di markdown   (default: "You")
-//   OPENCODE_ASSISTANT_NAME — label assistant           (default: "Assistant")
-//   OPENCODE_SESSION_PREFIX — prefix di judul note      (default: "Session")
+// ─── Config from env vars ───────────────────────────────────────────────
+// REQUIRED: OBSIDIAN_VAULT_PATH
+// Optional:
+//   OPENCODE_LOG_SUBDIR       subfolder in the vault (default "OpenCode-Logs")
+//   OPENCODE_USER_NAME        user label in markdown (default "You")
+//   OPENCODE_ASSISTANT_NAME   assistant label        (default "Assistant")
+//   OPENCODE_SESSION_PREFIX   note title prefix      (default "Session")
+//   OPENCODE_FILENAME_FORMAT  tokens {date} {hostname} {title} {sessionId}
 
 function getConfig() {
-  const vaultPath = process.env.OBSIDIAN_VAULT_PATH;
-  const logSubdir = process.env.OPENCODE_LOG_SUBDIR || "OpenCode-Logs";
-  const userName = process.env.OPENCODE_USER_NAME || "You";
-  const assistantName = process.env.OPENCODE_ASSISTANT_NAME || "Assistant";
-  const sessionPrefix = process.env.OPENCODE_SESSION_PREFIX || "Session";
-  // Filename format. Tokens: {date} {hostname} {title} {sessionId}
-  // Default keeps the original "YYYY-MM-DD - <title>" behaviour.
-  const filenameFormat =
-    process.env.OPENCODE_FILENAME_FORMAT || "{date} - {title}";
-
   return {
-    vaultPath,
-    logSubdir,
-    userName,
-    assistantName,
-    sessionPrefix,
-    filenameFormat,
+    vaultPath: process.env.OBSIDIAN_VAULT_PATH,
+    logSubdir: process.env.OPENCODE_LOG_SUBDIR || "OpenCode-Logs",
+    userName: process.env.OPENCODE_USER_NAME || "You",
+    assistantName: process.env.OPENCODE_ASSISTANT_NAME || "Assistant",
+    sessionPrefix: process.env.OPENCODE_SESSION_PREFIX || "Session",
+    filenameFormat: process.env.OPENCODE_FILENAME_FORMAT || "{date} - {title}",
   };
 }
 
 function resolveLogDir(vaultPath, logSubdir) {
-  // Expand ~/ kalau user pake path relatif home
   const resolved = vaultPath.startsWith("~")
     ? path.join(os.homedir(), vaultPath.slice(1))
     : vaultPath;
-
   return path.join(resolved, logSubdir);
 }
 
-// ─── Silent logging (ke file, bukan stdout/stderr) ──────────────────────
-// Plugin ini sengaja gak pernah console.log/console.error ke terminal,
-// karena `opencode export <id>` jalan di child process — stdout dipake
-// buat nerima JSON. Console.log nyampur -> JSON.parse gagal.
-// Stderr juga muncul di TUI opencode sebagai teks merah — ganggu.
-// Semua log dialihin ke file .plugin.log di folder log vault.
+// ─── Silent logging (to file, never stdout/stderr) ──────────────────────
+// Plugin output on stderr shows up in the TUI as red text. Keep it in a file.
 
 let LOG_DIR = null;
 let PLUGIN_LOG_FILE = null;
@@ -78,41 +68,56 @@ async function logToFile(message) {
   if (!dir) return;
   try {
     await mkdir(dir, { recursive: true });
-    const line = `[${new Date().toISOString()}] ${message}\n`;
-    await appendFile(PLUGIN_LOG_FILE, line);
+    await appendFile(PLUGIN_LOG_FILE, `[${new Date().toISOString()}] ${message}\n`);
   } catch {
-    // Logging gagal -> diemin, jangan bikin crash
+    // logging must never break the plugin
   }
 }
 
-// ─── jsonrepair: optional, auto-fix JSON cacat ──────────────────────────
-let jsonrepair = null;
-try {
-  ({ jsonrepair } = await import("jsonrepair"));
-} catch {
-  await logToFile(
-    `${PKG_NAME}: library 'jsonrepair' gak ke-load. JSON auto-repair disabled. ` +
-    "Ini bukan error — plugin tetap jalan normal."
-  );
+// ─── v2 shape normalisers ───────────────────────────────────────────────
+// v1 messages looked like { info: { role }, parts: [...] } with tool parts
+// keyed on `.tool`. v2 messages are flat: { type, content: [...] } with tool
+// parts keyed on `.name`, and plain-text messages carrying `.text` directly.
+// These readers accept either shape so the plugin survives further churn.
+
+function msgRole(msg) {
+  return msg?.type || msg?.info?.role || "unknown";
 }
+
+function msgParts(msg) {
+  if (Array.isArray(msg?.content)) return msg.content;
+  if (Array.isArray(msg?.parts)) return msg.parts;
+  if (typeof msg?.text === "string" && msg.text) return [{ type: "text", text: msg.text }];
+  return [];
+}
+
+function partToolName(part) {
+  return part?.name || part?.tool || "";
+}
+
+function sessionDirectory(info) {
+  return info?.location?.directory || info?.directory || "";
+}
+
+// Only real conversation goes into the note. v2 also emits system, synthetic,
+// idle and agent-switched messages, which are machinery rather than dialogue.
+const TRANSCRIPT_ROLES = new Set(["user", "assistant"]);
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 function sanitizeTitle(title) {
-  return title
-    .replace(/[\\/:*?"<>|]/g, "") // karakter ilegal di filename
+  return String(title)
+    .replace(/[\\/:*?"<>|]/g, "")
     .trim()
     .slice(0, 60);
 }
 
-// Build the note filename from a token template.
 // Tokens: {date} {hostname} {title} {sessionId}. Always ends in ".md".
 function buildFilename(format, tokens) {
   let name = format.replace(
     /\{(date|hostname|title|sessionId)\}/g,
     (_, k) => tokens[k] ?? ""
   );
-  // Collapse whitespace/leftover separators from empty tokens.
   name = name.replace(/\s{2,}/g, " ").replace(/^[\s-]+|[\s-]+$/g, "").trim();
   if (!name) name = tokens.title || tokens.sessionId || "session";
   if (!name.toLowerCase().endsWith(".md")) name += ".md";
@@ -121,7 +126,7 @@ function buildFilename(format, tokens) {
 
 function extractText(parts) {
   return parts
-    .filter((p) => p.type === "text")
+    .filter((p) => p.type === "text" && typeof p.text === "string")
     .map((p) => p.text)
     .join("\n\n")
     .trim();
@@ -132,27 +137,25 @@ function extractToolNotes(parts) {
     .filter((p) => p.type === "tool")
     .map((p) => {
       const input = p.state?.input ? JSON.stringify(p.state.input) : "";
-      return `> 🔧 tool: \`${p.tool}\` ${input}`;
+      return `> 🔧 tool: \`${partToolName(p)}\` ${input}`;
     });
 }
 
-// ─── Agent-context extraction (add-on) ──────────────────────────────────
-// The upstream plugin dumps the raw transcript. These helpers additionally
-// distill a compact, agent-readable summary + highlights block so a FUTURE
-// agent can @-load this note and resume work without re-deriving everything
-// from scratch.
+// ─── Agent-context extraction ───────────────────────────────────────────
+// Beyond the raw transcript, distill a compact summary so a FUTURE agent can
+// @-load this note and resume without re-deriving everything.
 
 const YAML_ESCAPE = (s) =>
   typeof s === "string" && /[:#\-?\[\]{}&*!|>'"%@`\n]/.test(s)
     ? JSON.stringify(s)
     : s;
 
-// Collect every distinct file path referenced by tool calls (read/edit/write).
-function extractFilesTouched(session) {
+const FILE_ARG_KEYS = ["filePath", "path", "file"];
+
+function extractFilesTouched(messages) {
   const files = new Set();
-  const FILE_ARG_KEYS = ["filePath", "path", "file"];
-  for (const msg of session.messages || []) {
-    for (const p of msg.parts || []) {
+  for (const msg of messages) {
+    for (const p of msgParts(msg)) {
       if (p.type !== "tool") continue;
       const input = p.state?.input || {};
       for (const k of FILE_ARG_KEYS) {
@@ -163,20 +166,20 @@ function extractFilesTouched(session) {
   return [...files];
 }
 
-// Tally which tools were used, most-used first.
-function extractToolUsage(session) {
+function extractToolUsage(messages) {
   const counts = new Map();
-  for (const msg of session.messages || []) {
-    for (const p of msg.parts || []) {
-      if (p.type !== "tool" || !p.tool) continue;
-      counts.set(p.tool, (counts.get(p.tool) || 0) + 1);
+  for (const msg of messages) {
+    for (const p of msgParts(msg)) {
+      if (p.type !== "tool") continue;
+      const name = partToolName(p);
+      if (!name) continue;
+      counts.set(name, (counts.get(name) || 0) + 1);
     }
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1]);
 }
 
-// Heuristic highlight extraction from assistant text: decisions, gotchas,
-// TODOs, and warnings. Line-based — cheap, deterministic, no LLM needed.
+// Line-based heuristics: cheap, deterministic, no extra LLM call.
 const HIGHLIGHT_PATTERNS = [
   { tag: "decision", re: /\b(decided|chose|going with|we will|approach:|plan:)\b/i },
   { tag: "gotcha", re: /\b(gotcha|caveat|note that|be careful|important:|warning|caution|beware)\b/i },
@@ -184,11 +187,11 @@ const HIGHLIGHT_PATTERNS = [
   { tag: "fix", re: /\b(root cause|the bug|the issue was|fixed by|because)\b/i },
 ];
 
-function extractHighlights(session, max = 12) {
+function extractHighlights(messages, max = 12) {
   const out = [];
-  for (const msg of session.messages || []) {
-    if (msg.info?.role !== "assistant") continue;
-    for (const p of msg.parts || []) {
+  for (const msg of messages) {
+    if (msgRole(msg) !== "assistant") continue;
+    for (const p of msgParts(msg)) {
       if (p.type !== "text" || !p.text) continue;
       for (const raw of p.text.split(/\n+/)) {
         const line = raw.trim().replace(/^[-*>#\s]+/, "");
@@ -206,11 +209,11 @@ function extractHighlights(session, max = 12) {
   return out;
 }
 
-// First substantive user message = the session's goal/intent.
-function extractGoal(session) {
-  for (const msg of session.messages || []) {
-    if (msg.info?.role !== "user") continue;
-    const text = extractText(msg.parts || []);
+// First substantive user message = the session's goal.
+function extractGoal(messages) {
+  for (const msg of messages) {
+    if (msgRole(msg) !== "user") continue;
+    const text = extractText(msgParts(msg));
     if (text) return text.slice(0, 400);
   }
   return "";
@@ -223,12 +226,24 @@ function formatModel(model) {
   return `${provider}${model.id || ""}`;
 }
 
-function buildAgentContext(session, cfg, opts = {}) {
-  const info = session.info || {};
-  const goal = extractGoal(session);
-  const files = extractFilesTouched(session);
-  const tools = extractToolUsage(session);
-  const highlights = extractHighlights(session);
+function formatTokens(tokens) {
+  if (!tokens) return "";
+  const cache = tokens.cache || {};
+  const parts = [
+    typeof tokens.input === "number" ? `in ${tokens.input}` : null,
+    typeof tokens.output === "number" ? `out ${tokens.output}` : null,
+    typeof tokens.reasoning === "number" && tokens.reasoning ? `reasoning ${tokens.reasoning}` : null,
+    typeof cache.read === "number" && cache.read ? `cache-read ${cache.read}` : null,
+    typeof cache.write === "number" && cache.write ? `cache-write ${cache.write}` : null,
+  ].filter(Boolean);
+  return parts.join(", ");
+}
+
+function buildAgentContext(info, messages, cfg, opts = {}) {
+  const goal = extractGoal(messages);
+  const files = extractFilesTouched(messages);
+  const tools = extractToolUsage(messages);
+  const highlights = extractHighlights(messages);
   const diff = info.summary || {};
   const summary = typeof opts.summary === "string" ? opts.summary.trim() : "";
 
@@ -240,8 +255,8 @@ function buildAgentContext(session, cfg, opts = {}) {
     `updated: ${new Date(info.time?.updated || Date.now()).toISOString()}`,
     `agent: ${YAML_ESCAPE(info.agent || "")}`,
     `model: ${YAML_ESCAPE(formatModel(info.model))}`,
-    `directory: ${YAML_ESCAPE(info.directory || "")}`,
-    `resume_cmd: ${YAML_ESCAPE(`opencode -s ${info.id || ""}`)}`,
+    `directory: ${YAML_ESCAPE(sessionDirectory(info))}`,
+    `resume_cmd: ${YAML_ESCAPE(`opencode --session ${info.id || ""}`)}`,
     "tags: [opencode-session, agent-context]",
     "---",
     "",
@@ -250,9 +265,9 @@ function buildAgentContext(session, cfg, opts = {}) {
   const ctx = ["## 🧭 Agent Context", ""];
   if (goal) ctx.push(`**Goal:** ${goal.replace(/\n/g, " ")}`, "");
 
-  // Agent-written narrative summary (passed in by the calling agent via the
-  // export_to_obsidian tool). Placed prominently so a future agent reads it
-  // first. Omitted on automatic session.idle exports where no agent authored one.
+  // Agent-written narrative summary, passed in via the export_to_obsidian
+  // tool. Placed first so a future agent reads it before anything else.
+  // Absent on automatic session.idle exports.
   if (summary) ctx.push("### 📝 Summary", "", summary, "");
 
   if (highlights.length) {
@@ -269,10 +284,7 @@ function buildAgentContext(session, cfg, opts = {}) {
   }
 
   if (tools.length) {
-    ctx.push(
-      "**Tools used:** " + tools.map(([t, n]) => `${t}×${n}`).join(", "),
-      ""
-    );
+    ctx.push("**Tools used:** " + tools.map(([t, n]) => `${t}×${n}`).join(", "), "");
   }
 
   if (typeof diff.additions === "number") {
@@ -282,22 +294,24 @@ function buildAgentContext(session, cfg, opts = {}) {
     );
   }
 
+  const tokenLine = formatTokens(info.tokens);
+  if (tokenLine) ctx.push(`**Tokens:** ${tokenLine}`, "");
+  if (typeof info.cost === "number" && info.cost > 0) {
+    ctx.push(`**Cost:** $${info.cost.toFixed(4)}`, "");
+  }
+
   ctx.push("---", "");
   return fm.join("\n") + ctx.join("\n");
 }
 
-function messagesToMarkdown(session, cfg, opts = {}) {
-  const info = session.info || {};
+function messagesToMarkdown(info, messages, cfg, opts = {}) {
   const title = info.title || info.id || "Untitled Session";
   const sessionId = info.id || "unknown";
   const createdMs = info.time?.created || Date.now();
 
-  const lines = [
-    buildAgentContext(session, cfg, opts),
-  ];
+  const lines = [buildAgentContext(info, messages, cfg, opts)];
 
-  // Summary-only notes stop after the Agent Context block. Full notes append
-  // the whole transcript below it.
+  // Summary-only notes stop after the Agent Context block.
   if (opts.transcript === false) {
     return { markdown: lines.join("\n"), title, sessionId, createdMs };
   }
@@ -312,19 +326,16 @@ function messagesToMarkdown(session, cfg, opts = {}) {
     ""
   );
 
-  for (const msg of session.messages || []) {
-    const role = msg.info?.role || "unknown";
-    const parts = msg.parts || [];
+  for (const msg of messages) {
+    const role = msgRole(msg);
+    if (!TRANSCRIPT_ROLES.has(role)) continue;
+
+    const parts = msgParts(msg);
     const text = extractText(parts);
     const toolNotes = extractToolNotes(parts);
-
     if (!text && toolNotes.length === 0) continue;
 
-    lines.push(
-      role === "user"
-        ? `## 🧑 ${cfg.userName}`
-        : `## 🤖 ${cfg.assistantName}`
-    );
+    lines.push(role === "user" ? `## 🧑 ${cfg.userName}` : `## 🤖 ${cfg.assistantName}`);
     if (toolNotes.length) lines.push(...toolNotes, "");
     if (text) lines.push(text);
     lines.push("");
@@ -333,22 +344,18 @@ function messagesToMarkdown(session, cfg, opts = {}) {
   return { markdown: lines.join("\n"), title, sessionId, createdMs };
 }
 
-// ─── Session index (track mapping session → filename) ───────────────────
-const INDEX_FILE_CACHE = new Map();
+// ─── Session index (session+kind → filename) ────────────────────────────
 
 function getIndexFilePath() {
   const dir = ensureLogDir();
-  if (!dir) return null;
-  return path.join(dir, ".session-index.json");
+  return dir ? path.join(dir, ".session-index.json") : null;
 }
 
 async function loadIndex() {
   const indexPath = getIndexFilePath();
   if (!indexPath) return {};
-
   try {
-    const raw = await readFile(indexPath, "utf-8");
-    return JSON.parse(raw);
+    return JSON.parse(await readFile(indexPath, "utf-8"));
   } catch {
     return {};
   }
@@ -357,135 +364,56 @@ async function loadIndex() {
 async function saveIndex(index) {
   const indexPath = getIndexFilePath();
   if (!indexPath) return;
-
   await writeFile(indexPath, JSON.stringify(index, null, 2));
 }
 
-// ─── Export session dari opencode CLI ───────────────────────────────────
-// IMPORTANT: We spawn `opencode export` with stdout redirected to a TEMP FILE
-// rather than capturing via a pipe (execFile). When this plugin runs *inside*
-// a live opencode/openchamber instance, the nested `opencode export` child
-// disposes its instance and exits before it finishes flushing a piped stdout,
-// which silently TRUNCATES the JSON (e.g. ~63KB instead of ~740KB) — only the
-// first handful of messages survive. Writing to a file has no pipe-buffer race,
-// so we get the complete transcript. See regression: truncated Obsidian notes.
-async function runExportToFile(sessionId) {
-  const tmpPath = path.join(
-    os.tmpdir(),
-    `opencode-obsidian-export-${sessionId}-${Date.now()}.json`
-  );
-  const fh = await open(tmpPath, "w");
-  try {
-    await new Promise((resolve, reject) => {
-      const child = spawn("opencode", ["export", sessionId], {
-        stdio: ["ignore", fh.fd, "ignore"],
-      });
-      child.on("error", reject);
-      child.on("close", (code) =>
-        code === 0
-          ? resolve()
-          : reject(new Error(`opencode export exited with code ${code}`))
-      );
-    });
-  } finally {
-    await fh.close();
-  }
-  return tmpPath;
+// ─── Fetch a session through the plugin context ─────────────────────────
+// v1 shelled out to `opencode export <id>`, which no longer exists in v2.
+
+async function fetchSession(ctx, sessionID) {
+  const [info, messages] = await Promise.all([
+    ctx.session.get({ sessionID }),
+    ctx.session.context({ sessionID }),
+  ]);
+  const resolvedInfo = info?.data || info || {};
+  const resolvedMessages = messages?.data || messages || [];
+  return {
+    info: resolvedInfo,
+    messages: Array.isArray(resolvedMessages) ? resolvedMessages : [],
+  };
 }
 
-async function exportSession(sessionId) {
-  const tmpPath = await runExportToFile(sessionId);
-  let stdout;
-  try {
-    stdout = await readFile(tmpPath, "utf-8");
-  } finally {
-    await rm(tmpPath, { force: true }).catch(() => {});
-  }
+// ─── Export one session → write the note ────────────────────────────────
+// Returns the absolute path written, or null when skipped.
 
-  // CLI kadang ngeprint teks lain ke stdout bareng JSON-nya.
-  // Potong dari { pertama ke } terakhir biar sampah gak ikut ke parser.
-  const firstBrace = stdout.indexOf("{");
-  const lastBrace = stdout.lastIndexOf("}");
-  const jsonSlice =
-    firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace
-      ? stdout.slice(firstBrace, lastBrace + 1)
-      : stdout;
-
-  try {
-    return JSON.parse(jsonSlice);
-  } catch (firstErr) {
-    // Coba repair kalo jsonrepair tersedia
-    if (jsonrepair) {
-      try {
-        const repaired = jsonrepair(jsonSlice);
-        const session = JSON.parse(repaired);
-        await logToFile(
-          `sesi ${sessionId}: JSON cacat, berhasil di-repair.`
-        );
-        return session;
-      } catch {
-        // lanjut ke dump
-      }
-    }
-
-    // Dump stdout mentah buat debugging
-    const dir = ensureLogDir();
-    if (dir) {
-      const debugPath = path.join(dir, `.debug-export-${sessionId}.txt`);
-      try {
-        await mkdir(dir, { recursive: true });
-        await writeFile(debugPath, stdout ?? "");
-        await logToFile(
-          `sesi ${sessionId}: gagal parse (length: ${stdout?.length ?? 0}). Debug: ${debugPath}`
-        );
-      } catch (dumpErr) {
-        await logToFile(
-          `sesi ${sessionId}: gagal parse + gagal dump: ${dumpErr}`
-        );
-      }
-    }
-    throw firstErr;
-  }
-}
-
-// ─── Shared: export one session → write note to vault ───────────────────
-// Returns the absolute path of the written note (or null if skipped).
-async function writeSessionNote(sessionId, cfg, opts = {}) {
+async function writeSessionNote(ctx, sessionId, cfg, opts = {}) {
   if (!cfg.vaultPath) return null;
 
-  const session = await exportSession(sessionId);
-  const { markdown, title, createdMs } = messagesToMarkdown(session, cfg, opts);
+  const { info, messages } = await fetchSession(ctx, sessionId);
+  const { markdown, title, createdMs } = messagesToMarkdown(info, messages, cfg, opts);
 
   const dateStr = new Date(createdMs).toISOString().slice(0, 10);
   const safeTitle = sanitizeTitle(title);
 
-  // Which kind of note is this? Drives the filename suffix + index key so a
-  // summary note and a transcript note for the SAME session coexist instead
-  // of overwriting each other.
+  // Summary and transcript notes for the SAME session must coexist rather
+  // than overwrite each other, so the kind is part of both name and index key.
   const kind = opts.transcript === false ? "Summary" : "Transcript";
+  const tokens = {
+    date: dateStr,
+    title: safeTitle,
+    hostname: sanitizeTitle(os.hostname().split(".")[0]),
+    sessionId,
+  };
 
   let filename;
   if (opts.filename) {
-    // Explicit override from the caller (e.g. a command). Sanitize + ensure .md.
-    filename = buildFilename(String(opts.filename), {
-      date: dateStr,
-      title: safeTitle,
-      hostname: sanitizeTitle(os.hostname().split(".")[0]),
-      sessionId,
-    });
+    filename = buildFilename(String(opts.filename), tokens);
   } else {
-    // Default: "<format> <Summary|Transcript>.md".
-    const base = buildFilename(cfg.filenameFormat, {
-      date: dateStr,
-      title: safeTitle,
-      hostname: sanitizeTitle(os.hostname().split(".")[0]),
-      sessionId,
-    }).replace(/\.md$/i, "");
+    const base = buildFilename(cfg.filenameFormat, tokens).replace(/\.md$/i, "");
     filename = `${base} ${kind}.md`;
   }
 
   const logDir = resolveLogDir(cfg.vaultPath, cfg.logSubdir);
-
   await mkdir(logDir, { recursive: true });
 
   const indexKey = `${sessionId}::${kind}`;
@@ -504,50 +432,30 @@ async function writeSessionNote(sessionId, cfg, opts = {}) {
   return fullPath;
 }
 
-// ─── Plugin entry — dipanggil opencode ──────────────────────────────────
+// ─── Plugin definition ──────────────────────────────────────────────────
 
-export const ExportToObsidian = async ({ project, directory }) => {
-  // Validasi config di startup
-  const cfg = getConfig();
-  if (!cfg.vaultPath) {
-    // Kita gak bisa console.error di sini karena bisa nyampur.
-    // Log ke file doang.
-    await logToFile(
-      `${PKG_NAME} v${PKG_VERSION}: ERROR — OBSIDIAN_VAULT_PATH belum di-set!\n` +
-      "Plugin aktif tapi gak bakal nulis apa-apa sampe env var di-set.\n" +
-      `  Linux/Mac:  export OBSIDIAN_VAULT_PATH="/path/ke/vault"\n` +
-      `  Windows:    $env:OBSIDIAN_VAULT_PATH = "C:\\Users\\...\\vault"\n` +
-      "  (taruh di ~/.bashrc / PowerShell profile biar permanen)"
-    );
-  } else {
-    await logToFile(
-      `${PKG_NAME} v${PKG_VERSION} loaded. Logs → ${resolveLogDir(cfg.vaultPath, cfg.logSubdir)}`
-    );
-  }
+export default {
+  id: "obsidian-export",
 
-  return {
-    // Track the active session id so the manual tool can default to it.
-    event: async ({ event }) => {
-      const sid = event.properties?.sessionID || event.sessionID;
-      if (sid) LAST_ACTIVE_SESSION_ID = sid;
+  async setup(ctx) {
+    const cfg = getConfig();
+    if (!cfg.vaultPath) {
+      await logToFile(
+        `${PKG_NAME} v${PKG_VERSION}: OBSIDIAN_VAULT_PATH is not set. ` +
+          "The plugin is loaded but will not write anything until it is.\n" +
+          '  export OBSIDIAN_VAULT_PATH="/path/to/vault"'
+      );
+    } else {
+      await logToFile(
+        `${PKG_NAME} v${PKG_VERSION} loaded. Notes → ${resolveLogDir(cfg.vaultPath, cfg.logSubdir)}`
+      );
+    }
 
-      if (event.type !== "session.idle") return;
-      if (!sid) return;
-
-      const currentCfg = getConfig();
-      if (!currentCfg.vaultPath) return; // env var gak di-set, skip
-
-      try {
-        await writeSessionNote(sid, currentCfg);
-      } catch (err) {
-        await logToFile(`gagal export sesi: ${err?.stack || err}`);
-      }
-    },
-
-    // Manual export trigger. Lets the user/agent export on demand instead of
-    // waiting for session.idle — e.g. "export this session to obsidian".
-    tool: {
-      export_to_obsidian: tool({
+    // Manual export trigger, so the user or agent can export on demand
+    // instead of waiting for session.idle.
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "export_to_obsidian",
         description:
           "Export the current (or a specified) opencode session to the " +
           "Obsidian vault as a markdown note. Before calling, WRITE a concise " +
@@ -556,68 +464,96 @@ export const ExportToObsidian = async ({ project, directory }) => {
           "was actually done, key decisions/gotchas, the current state, and " +
           "clear next steps. Use when the user asks to save/export/sync the " +
           "session to Obsidian.",
-        args: {
-          sessionId: tool.schema
-            .string()
-            .optional()
-            .describe(
-              "Session id to export. Omit to export the current session."
-            ),
-          summary: tool.schema
-            .string()
-            .optional()
-            .describe(
-              "A concise narrative summary YOU (the agent) write for the " +
+        input: {
+          type: "object",
+          properties: {
+            sessionId: {
+              type: "string",
+              description: "Session id to export. Omit to export the current session.",
+            },
+            summary: {
+              type: "string",
+              description:
+                "A concise narrative summary YOU (the agent) write for the " +
                 "note's Agent Context block. Cover: goal, what was done, key " +
                 "decisions/gotchas, current state, and next steps. Markdown " +
-                "allowed. Omit only if there is genuinely nothing to summarize."
-            ),
-          transcript: tool.schema
-            .boolean()
-            .optional()
-            .describe(
-              "true (default) writes the full transcript note. false writes a " +
-                "summary-only note (Agent Context block, no message dump)."
-            ),
-          filename: tool.schema
-            .string()
-            .optional()
-            .describe(
-              "Optional filename override. Tokens {date}{hostname}{title}" +
-                "{sessionId} are expanded; '.md' is added if missing. When " +
-                "omitted, the name is '<hostname> - <title> " +
-                "<Summary|Transcript>.md'."
-            ),
+                "allowed. Omit only if there is genuinely nothing to summarize.",
+            },
+            transcript: {
+              type: "boolean",
+              description:
+                "true (default) writes the full transcript note. false writes a " +
+                "summary-only note (Agent Context block, no message dump).",
+            },
+            filename: {
+              type: "string",
+              description:
+                "Optional filename override. Tokens {date} {hostname} {title} " +
+                "{sessionId} are expanded; '.md' is added if missing.",
+            },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
+        async execute(input, toolContext) {
           const currentCfg = getConfig();
           if (!currentCfg.vaultPath) {
-            return (
-              "OBSIDIAN_VAULT_PATH is not set — cannot export. " +
-              'Set it, e.g. export OBSIDIAN_VAULT_PATH="/path/to/vault".'
-            );
+            return {
+              content:
+                "OBSIDIAN_VAULT_PATH is not set — cannot export. " +
+                'Set it, e.g. export OBSIDIAN_VAULT_PATH="/path/to/vault".',
+            };
           }
 
-          const sid = args.sessionId || LAST_ACTIVE_SESSION_ID;
+          const sid = input?.sessionId || toolContext?.sessionID;
           if (!sid) {
-            return "No session id available yet. Pass sessionId explicitly.";
+            return { content: "No session id available. Pass sessionId explicitly." };
           }
 
           try {
-            const written = await writeSessionNote(sid, currentCfg, {
-              summary: args.summary,
-              transcript: args.transcript,
-              filename: args.filename,
+            const written = await writeSessionNote(ctx, sid, currentCfg, {
+              summary: input?.summary,
+              transcript: input?.transcript,
+              filename: input?.filename,
             });
-            return written
-              ? `Exported session ${sid} → ${written}`
-              : `Nothing written for session ${sid}.`;
+            return {
+              content: written
+                ? `Exported session ${sid} → ${written}`
+                : `Nothing written for session ${sid}.`,
+            };
           } catch (err) {
-            await logToFile(`manual export gagal: ${err?.stack || err}`);
-            return `Export failed for ${sid}: ${err?.message || err}`;
+            await logToFile(`manual export failed: ${err?.stack || err}`);
+            return { content: `Export failed for ${sid}: ${err?.message || err}` };
           }
         },
-      }),
-    },
-  };
+      });
+    });
+
+    // Auto-export whenever a session goes idle.
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event?.type !== "session.idle") continue;
+
+          const sid = event.properties?.sessionID || event.sessionID;
+          if (!sid) continue;
+
+          const currentCfg = getConfig();
+          if (!currentCfg.vaultPath) continue;
+
+          try {
+            await writeSessionNote(ctx, sid, currentCfg);
+          } catch (err) {
+            await logToFile(`auto export failed for ${sid}: ${err?.stack || err}`);
+          }
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          await logToFile(`event stream ended: ${err?.stack || err}`);
+        }
+      }
+    })();
+
+    return () => controller.abort();
+  },
 };

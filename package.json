@@ -1,7 +1,7 @@
 {
   "name": "opencode-obsidian-export",
-  "version": "1.1.0",
-  "description": "Auto-save opencode sessions to Obsidian vault as markdown, with an agent-context summary (goal, highlights, files touched) and a manual export tool.",
+  "version": "2.0.0",
+  "description": "Auto-save opencode sessions to Obsidian vault as markdown, with an agent-context summary (goal, highlights, files touched) and a manual export tool. Requires OpenCode v2.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -26,11 +26,8 @@
     "url": "https://github.com/aditrachman/Opencode-Obsidian-Export/issues"
   },
   "homepage": "https://github.com/aditrachman/Opencode-Obsidian-Export#readme",
-  "dependencies": {
-    "jsonrepair": "^3.15.0"
-  },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode/plugin": "*"
   },
   "engines": {
     "node": ">=18"
